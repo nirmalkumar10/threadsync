@@ -10,9 +10,11 @@
 #include <semaphore.h>
 
 #define HASH_ELEMS 5
+#define CORE0  0
+
 typedef struct HmOutData{
 	int DataId;
-        int DataValid;
+	int DataValid;
 	unsigned char *Encrypted;
 	struct HmOutData *next;
 }HmOutData_t;
@@ -22,24 +24,22 @@ HmOutData_t *HmOutElem[HASH_ELEMS];
 typedef struct TD{
 	unsigned char *plain;
 	unsigned char *keys;
-	int count;
-	int cpuid;
 	int index;
 	int loopcount;
 	int buffer_count;
 	HmOutData_t *trav;
-	sem_t read_sem;
-	sem_t write_sem;
+	sem_t read_sem;         /* Read semaphore used by helper threads waiting on main thread to provide plaintext data*/
+	sem_t write_sem;        /* Write semaphore used by main thread to overwrite new data when helper threads complete encryption*/
 }ThreadData_t;
 
 
 pthread_cond_t cpu_cond_mutex;
 pthread_cond_t *out_cond = NULL;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-int KeyFilesize;
-char cpu_avail = 0;
-int current_thread_count;
-int NoOfProcessors;
+static int KeyFilesize;
+static char cpu_avail = 0;
+static int current_thread_count;
+static int NoOfProcessors;
 
 void print_error(FILE *std,const char *fmt,...)
 {
@@ -78,9 +78,9 @@ void* XorEncrypt(void *arg)
 		}
 		for(tdata->loopcount = 0;tdata->loopcount < KeyFilesize;tdata->loopcount++){
 			tdata->trav->Encrypted[tdata->loopcount] = tdata->plain[tdata->loopcount] ^ tdata->keys[tdata->loopcount];   
-  			//printf("Xor:%d\t",tdata->trav->Encrypted[tdata->loopcount]);
+			//printf("Xor:%d\t",tdata->trav->Encrypted[tdata->loopcount]);
 		}
-                tdata->trav->DataValid =1;
+		tdata->trav->DataValid =1;
 		printf("\n");
 		sem_post(&tdata->write_sem);
 	}
@@ -94,7 +94,7 @@ void* OutputData(void *arg)
 		int index = (buffer_read_count /10);
 		int offset = (buffer_read_count %10);
 		HmOutData_t *trav = HmOutElem[index];
-                printf("index:%d offset:%d\n",index,offset);
+		printf("index:%d offset:%d\n",index,offset);
 		for(int i=0;i<offset;i++){
 			trav = trav->next;
 		}
@@ -137,13 +137,13 @@ int main(int argc,char *argv[]){
 
 	int opt,NumThreads;
 	char *KeyFilename;
-        void *ret;
+	void *ret;
 	unsigned char *Keys;
 	if(argc < 5){
 		usage();       
 		exit(0);
 	}
-	while((opt = getopt(argc,argv,"n:k:")) != -1){
+	while((opt = getopt(argc,argv,"n:k:")) != -1){  /* Get Options for Number of threads and keyfile name*/
 		switch(opt){
 			case 'n':
 				NumThreads = atoi(optarg);
@@ -157,6 +157,7 @@ int main(int argc,char *argv[]){
 						KeyFilename[len] = '\0';
 					}else{
 						print_error(stderr,"Unable to allocate memory for KeyFilename:%s\n",optarg);
+                                                exit(0);
 					}
 					break;
 				}
@@ -165,7 +166,7 @@ int main(int argc,char *argv[]){
 				exit(0);
 		}
 	}
-	if(KeyFilename != NULL){
+	if(KeyFilename != NULL){              /* Open KeyFile ,read the size and store the key */
 		struct stat st;
 		FILE *key_fp = fopen(KeyFilename,"rb");
 		if(key_fp != NULL){
@@ -173,6 +174,7 @@ int main(int argc,char *argv[]){
 				KeyFilesize = st.st_size;
 			}else{
 				print_error(stderr,"Could not determine File Size for File:%s",KeyFilename);
+                                exit(0);
 			}
 			Keys = (unsigned char *)malloc(sizeof(char) * KeyFilesize);
 			fread(Keys,sizeof(char),KeyFilesize,key_fp);
@@ -180,39 +182,39 @@ int main(int argc,char *argv[]){
 			fclose(key_fp);
 		}else{
 			print_error(stderr,"Could not open :%s\n",KeyFilename);
+                        exit(0);
 		}       
 
 	}
 
-	Create_HashOutData();
+	NoOfProcessors = sysconf(_SC_NPROCESSORS_ONLN);       
 
-	NoOfProcessors = sysconf(_SC_NPROCESSORS_ONLN);
-	for(int i=0;i<NoOfProcessors;i++){
-		cpu_avail |= (1<<i);
-	}
 	pthread_t *tid = (pthread_t*)malloc(sizeof(pthread_t)*NumThreads);
-        pthread_t out_id;
+	pthread_t out_id;
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	ThreadData_t *Tdata= (ThreadData_t*)malloc(sizeof(ThreadData_t)*NumThreads);       
-	//out_cond = (pthread_cond_t*)malloc(sizeof(pthread_cond_t) * NoOfProcessors);
 	cpu_set_t cpus;
 
 	int current_core =1;
-	int thread_count =0;
-        int current_buffer_write_count =0;
+	int current_buffer_write_count =0;
 
+	CPU_ZERO(&cpus);
+	CPU_SET(CORE0,&cpus);
+	sched_setaffinity(0,sizeof(cpu_set_t),&cpus);  /* Set Main thread to run from CORE 0 */
+
+	Create_HashOutData();                        /* Initialise datastructure for storing encrypted data */
+	printf("Main process CPU:%3d\n",sched_getcpu());
 	for(int threadcount = 0;threadcount <NumThreads;threadcount++){
-
-		CPU_ZERO(&cpus);
-		CPU_SET(current_core,&cpus);
-		Tdata[threadcount].cpuid = threadcount;
 		Tdata[threadcount].plain = (unsigned char*)malloc(sizeof(char)*KeyFilesize);
 		Tdata[threadcount].keys = (unsigned char*)malloc(sizeof(char)*KeyFilesize);
 		sem_init(&Tdata[threadcount].read_sem,1,0);
-		sem_init(&Tdata[threadcount].write_sem,1,1);
+		sem_init(&Tdata[threadcount].write_sem,1,1);  
+
+		CPU_ZERO(&cpus);
+		CPU_SET(current_core,&cpus);
 		pthread_attr_setaffinity_np(&attr,sizeof(cpu_set_t),&cpus);
-		pthread_create(&tid[threadcount],&attr,XorEncrypt,&Tdata[threadcount]);
+		pthread_create(&tid[threadcount],&attr,XorEncrypt,&Tdata[threadcount]);  /* Create threads with different CPU affinity */
 		current_core++;
 		if((current_core) == NoOfProcessors){
 			current_core =1;
@@ -220,31 +222,28 @@ int main(int argc,char *argv[]){
 
 	}
 
-        pthread_create(&out_id,NULL,OutputData,NULL);
+	CPU_ZERO(&cpus);
+	CPU_SET(CORE0,&cpus);
+	pthread_attr_setaffinity_np(&attr,sizeof(cpu_set_t),&cpus); 
+	pthread_create(&out_id,&attr,OutputData,NULL); /* Separate thread running from CORE0 to output encrypted data */
 
 	while(!feof(stdin)){
 
 		for(int threadcount =0;threadcount<NumThreads;threadcount++){
 
-
 			if(sem_wait(&Tdata[threadcount].write_sem) == 0){
 				fread(Tdata[threadcount].plain,sizeof(char),KeyFilesize,stdin);
-				for(int i=0;i<KeyFilesize;i++){
-
-					//printf("data:%d\n",Tdata[threadcount].plain[i]);
-				}
 				memcpy(Tdata[threadcount].keys,Keys,KeyFilesize);
 				Tdata[threadcount].buffer_count = current_buffer_write_count;
 				current_buffer_write_count++;
 				sem_post(&Tdata[threadcount].read_sem);
-				shiftkeys(Keys);
+				shiftkeys(Keys);              /* Shift encryption key after one block */
 			}else{
 				continue;
 			}
 
 		}
 	}
-//while(1);
-pthread_join(out_id,&ret);
+	pthread_join(out_id,&ret);
 
 }
